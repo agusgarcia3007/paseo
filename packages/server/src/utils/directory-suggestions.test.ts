@@ -19,6 +19,7 @@ import {
   searchDirectoryEntries,
   WORKSPACE_SEARCH_HIDDEN_DIRECTORIES,
 } from "./directory-suggestions.js";
+import { PathIndexes } from "./path-index.js";
 
 const isWindows = isPlatform("win32");
 const filesystemRootDirectoryName = isWindows ? "Windows" : "usr";
@@ -1184,5 +1185,139 @@ describe("filesystem threads held by concurrent searches", () => {
     const peak = await peakPendingFilesystemRequests(searchWhileTyping);
 
     expect(peak).toBe(1);
+  });
+});
+
+describe("indexed search", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "indexed-search-")));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function workspaceSearch(
+    query: string,
+    extra: Partial<Parameters<typeof searchDirectoryEntries>[0]> = {},
+  ) {
+    return searchDirectoryEntries({
+      root,
+      query,
+      pathFormat: "relative",
+      pathQueryPolicy: "slashes",
+      blankQueryBehavior: "children",
+      traversableHiddenDirectoryNames: WORKSPACE_SEARCH_HIDDEN_DIRECTORIES,
+      respectGitIgnore: true,
+      includeFiles: true,
+      includeDirectories: true,
+      ...extra,
+    });
+  }
+
+  async function indexedSearch(indexes: PathIndexes, query: string, extra = {}) {
+    await workspaceSearch(query, { ...extra, pathIndexes: indexes });
+    await indexes.idle();
+    return workspaceSearch(query, { ...extra, pathIndexes: indexes });
+  }
+
+  it("returns what an unbounded walk returns", async () => {
+    initGitRepo(root, "generated/\n");
+    const files = [
+      "src/app/report-view.tsx",
+      "src/app/reports.ts",
+      "src/lib/report.ts",
+      "docs/reporting.md",
+      ".github/workflows/report.yml",
+      "node_modules/report/index.js",
+      ".cache/report.ts",
+      "generated/report.ts",
+      "src/app/.report.ts",
+      "a/b/c/d/e/report-deep.ts",
+    ];
+    for (const file of files) {
+      mkdirSync(path.join(root, path.dirname(file)), { recursive: true });
+      writeFileSync(path.join(root, file), "");
+    }
+    const indexes = new PathIndexes();
+    const queries = ["report", "rep", "rprt", "src/app", "app/rep", "workflows", "deep", "zzz"];
+
+    const results = [];
+    for (const query of queries) {
+      results.push({
+        query,
+        walked: await workspaceSearch(query, { maxEntriesScanned: 1_000_000, maxDepth: 4 }),
+        indexed: await indexedSearch(indexes, query, { maxDepth: 4 }),
+      });
+    }
+
+    expect(results.map(({ query, indexed }) => ({ query, entries: indexed }))).toEqual(
+      results.map(({ query, walked }) => ({ query, entries: walked })),
+    );
+  });
+
+  it("finds a match past the walk's scan budget", async () => {
+    for (let index = 0; index < 30; index += 1) {
+      mkdirSync(path.join(root, `package-${index}`, "src"), { recursive: true });
+    }
+    writeFileSync(path.join(root, "package-29", "src", "checkout-flow.ts"), "");
+
+    const walked = await workspaceSearch("checkout-flow", { maxEntriesScanned: 20 });
+    const indexed = await indexedSearch(new PathIndexes(), "checkout-flow", {
+      maxEntriesScanned: 20,
+    });
+
+    expect({ walked, indexed }).toEqual({
+      walked: [],
+      indexed: [{ path: "package-29/src/checkout-flow.ts", kind: "file" }],
+    });
+  });
+
+  it("rebuilds after the watched root changes", async () => {
+    writeFileSync(path.join(root, "notes.md"), "");
+    let changed: (() => void) | null = null;
+    const watchedRoots: string[] = [];
+    const indexes = new PathIndexes({
+      watch: async (watchedRoot, onChange) => {
+        watchedRoots.push(watchedRoot);
+        changed = onChange;
+        return () => {};
+      },
+    });
+    const before = await indexedSearch(indexes, "invoice");
+    writeFileSync(path.join(root, "invoice.ts"), "");
+    const unchanged = await indexedSearch(indexes, "invoice");
+    changed?.();
+
+    const after = await indexedSearch(indexes, "invoice");
+
+    expect({ watchedRoots, before, unchanged, after }).toEqual({
+      watchedRoots: [root],
+      before: [],
+      unchanged: [],
+      after: [{ path: "invoice.ts", kind: "file" }],
+    });
+  });
+
+  it.skipIf(isWindows)("lists a symlinked folder's files under their real path", async () => {
+    mkdirSync(path.join(root, "real", "nested"), { recursive: true });
+    writeFileSync(path.join(root, "real", "nested", "target-file.ts"), "");
+    symlinkSync(path.join(root, "real"), path.join(root, "alias"), "dir");
+
+    const entries = await indexedSearch(new PathIndexes(), "target-file");
+
+    expect(entries).toEqual([{ path: "real/nested/target-file.ts", kind: "file" }]);
+  });
+
+  it("walks when the tree is larger than the index allows", async () => {
+    for (let index = 0; index < 10; index += 1) {
+      writeFileSync(path.join(root, `module-${index}.ts`), "");
+    }
+
+    const entries = await indexedSearch(new PathIndexes({ maxEntries: 5 }), "module-7");
+
+    expect(entries).toEqual([{ path: "module-7.ts", kind: "file" }]);
   });
 });
