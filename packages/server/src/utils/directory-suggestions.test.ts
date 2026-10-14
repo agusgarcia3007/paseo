@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isPlatform } from "../test-utils/platform.js";
 import { startPathContainmentMetrics, stopPathContainmentMetrics } from "./path.js";
 import { startGitCommandMetrics, stopGitCommandMetrics } from "./run-git-command.js";
@@ -1190,14 +1190,27 @@ describe("filesystem threads held by concurrent searches", () => {
 
 describe("indexed search", () => {
   let root: string;
+  let changeRoot: () => void;
 
   beforeEach(() => {
     root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "indexed-search-")));
+    changeRoot = () => {};
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     rmSync(root, { recursive: true, force: true });
   });
+
+  function watchedIndexes(maxEntries?: number): PathIndexes {
+    return new PathIndexes({
+      maxEntries,
+      watch: async (_root, onChange) => {
+        changeRoot = onChange;
+        return () => {};
+      },
+    });
+  }
 
   function workspaceSearch(
     query: string,
@@ -1241,7 +1254,7 @@ describe("indexed search", () => {
       mkdirSync(path.join(root, path.dirname(file)), { recursive: true });
       writeFileSync(path.join(root, file), "");
     }
-    const indexes = new PathIndexes();
+    const indexes = watchedIndexes();
     const queries = ["report", "rep", "rprt", "src/app", "app/rep", "workflows", "deep", "zzz"];
 
     const results = [];
@@ -1265,7 +1278,7 @@ describe("indexed search", () => {
     writeFileSync(path.join(root, "package-29", "src", "checkout-flow.ts"), "");
 
     const walked = await workspaceSearch("checkout-flow", { maxEntriesScanned: 20 });
-    const indexed = await indexedSearch(new PathIndexes(), "checkout-flow", {
+    const indexed = await indexedSearch(watchedIndexes(), "checkout-flow", {
       maxEntriesScanned: 20,
     });
 
@@ -1275,29 +1288,36 @@ describe("indexed search", () => {
     });
   });
 
-  it("rebuilds after the watched root changes", async () => {
+  it("returns a file created before a watched change on the next search", async () => {
     writeFileSync(path.join(root, "notes.md"), "");
-    let changed: (() => void) | null = null;
-    const watchedRoots: string[] = [];
-    const indexes = new PathIndexes({
-      watch: async (watchedRoot, onChange) => {
-        watchedRoots.push(watchedRoot);
-        changed = onChange;
-        return () => {};
-      },
-    });
+    const indexes = watchedIndexes();
     const before = await indexedSearch(indexes, "invoice");
     writeFileSync(path.join(root, "invoice.ts"), "");
-    const unchanged = await indexedSearch(indexes, "invoice");
-    changed?.();
+    changeRoot();
 
-    const after = await indexedSearch(indexes, "invoice");
+    const after = await workspaceSearch("invoice", { pathIndexes: indexes });
 
-    expect({ watchedRoots, before, unchanged, after }).toEqual({
-      watchedRoots: [root],
+    expect({ before, after }).toEqual({
       before: [],
-      unchanged: [],
       after: [{ path: "invoice.ts", kind: "file" }],
+    });
+  });
+
+  it("stops suggesting a folder once Git ignores it", async () => {
+    initGitRepo(root, "");
+    mkdirSync(path.join(root, "build-cache"), { recursive: true });
+    writeFileSync(path.join(root, "build-cache", "artifact.js"), "");
+    const indexes = watchedIndexes();
+    const before = await indexedSearch(indexes, "artifact");
+    writeFileSync(path.join(root, ".gitignore"), "build-cache/\n");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000);
+
+    const after = await workspaceSearch("artifact", { pathIndexes: indexes });
+
+    expect({ before, after }).toEqual({
+      before: [{ path: "build-cache/artifact.js", kind: "file" }],
+      after: [],
     });
   });
 
@@ -1306,7 +1326,7 @@ describe("indexed search", () => {
     writeFileSync(path.join(root, "real", "nested", "target-file.ts"), "");
     symlinkSync(path.join(root, "real"), path.join(root, "alias"), "dir");
 
-    const entries = await indexedSearch(new PathIndexes(), "target-file");
+    const entries = await indexedSearch(watchedIndexes(), "target-file");
 
     expect(entries).toEqual([{ path: "real/nested/target-file.ts", kind: "file" }]);
   });
@@ -1316,7 +1336,7 @@ describe("indexed search", () => {
       writeFileSync(path.join(root, `module-${index}.ts`), "");
     }
 
-    const entries = await indexedSearch(new PathIndexes({ maxEntries: 5 }), "module-7");
+    const entries = await indexedSearch(watchedIndexes(5), "module-7");
 
     expect(entries).toEqual([{ path: "module-7.ts", kind: "file" }]);
   });

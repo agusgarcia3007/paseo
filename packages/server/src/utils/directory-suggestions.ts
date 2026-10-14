@@ -11,6 +11,7 @@ import {
   isAscii,
   keepBest,
   mayMatch,
+  type BuildIndex,
   type IndexedEntry,
   type PathIndexes,
 } from "./path-index.js";
@@ -123,8 +124,9 @@ const NO_MATCH_OFFSET = Number.MAX_SAFE_INTEGER;
 const NO_FUZZY_SCORE = Number.MAX_SAFE_INTEGER;
 const NO_MATCH_TIER = 5;
 const FALLBACK_TIER = 4;
-const INDEX_BUILD_CONCURRENCY = 1;
 const INDEX_BUILD_YIELD_MS = 5;
+const URGENT_INDEX_BUILD_CONCURRENCY = 2;
+const INDEX_BUILD_MAX_YIELD_MS = 10_000;
 const INDEX_BUILD_BATCH = 64;
 
 // Each pending fs call holds one of libuv's shared threadpool threads (4 by default), and a read on
@@ -360,11 +362,14 @@ async function searchTree(
   if (!pathIndexes || start.resolvedPath !== input.root || start.visiblePath !== input.root) {
     return walkTree(input, start);
   }
-  const entries = pathIndexes.lookup(indexKey(input), input.root, () =>
-    buildIndex(input, pathIndexes.maxEntries),
-  );
+  const key = indexKey(input);
+  const signature = ignoreSignature(input.gitIgnoredPaths);
+  const build: BuildIndex = (isUrgent) => buildIndex(input, pathIndexes.maxEntries, isUrgent);
+  const entries = await pathIndexes.get(key, signature, build);
   if (entries) return searchIndex(entries, input);
-  return walkTree(input, start);
+  const walked = await walkTree(input, start);
+  pathIndexes.prepare(key, input.root, signature, build);
+  return walked;
 }
 
 async function walkTree(input: SearchInput, start: WalkStart): Promise<RankedEntry[]> {
@@ -420,6 +425,17 @@ function indexKey(input: SearchInput): string {
   ]);
 }
 
+const ignoreSignatures = new WeakMap<Set<string>, string>();
+
+function ignoreSignature(gitIgnoredPaths: Set<string>): string {
+  let signature = ignoreSignatures.get(gitIgnoredPaths);
+  if (signature === undefined) {
+    signature = [...gitIgnoredPaths].sort().join("\0");
+    ignoreSignatures.set(gitIgnoredPaths, signature);
+  }
+  return signature;
+}
+
 interface IndexedDirectory {
   resolvedPath: string;
   relativePath: string;
@@ -433,19 +449,22 @@ interface IndexBuild {
   links: IndexedDirectory[];
 }
 
-async function buildIndex(input: SearchInput, maxEntries: number): Promise<IndexedEntry[] | null> {
-  const limit = pLimit(INDEX_BUILD_CONCURRENCY);
+async function buildIndex(
+  input: SearchInput,
+  maxEntries: number,
+  isUrgent: () => boolean,
+): Promise<IndexedEntry[] | null> {
+  const yieldUntil = Date.now() + INDEX_BUILD_MAX_YIELD_MS;
   const into: IndexBuild = { entries: [], visited: new Set([input.root]), next: [], links: [] };
   let level: IndexedDirectory[] = [{ resolvedPath: input.root, relativePath: "", depth: 0 }];
   while (level.length > 0) {
-    const listings = await Promise.all(
-      level.map((directory) => limit(() => listInBackground(directory.resolvedPath))),
-    );
-    for (const [index, children] of listings.entries()) {
-      indexChildren(level[index], children, input, into);
-      if (index % INDEX_BUILD_BATCH === INDEX_BUILD_BATCH - 1) await yieldToEventLoop();
+    for (let start = 0; start < level.length; start += INDEX_BUILD_BATCH) {
+      const batch = level.slice(start, start + INDEX_BUILD_BATCH);
+      const listings = await listBatch(batch, isUrgent, yieldUntil);
+      for (const [index, children] of listings.entries()) {
+        if (!indexChildren(batch[index], children, input, into, maxEntries)) return null;
+      }
     }
-    if (into.entries.length > maxEntries) return null;
     level = into.next.length > 0 ? into.next : unvisitedLinks(into);
     into.next = [];
   }
@@ -459,16 +478,35 @@ function unvisitedLinks(into: IndexBuild): IndexedDirectory[] {
   return links;
 }
 
+async function listBatch(
+  batch: IndexedDirectory[],
+  isUrgent: () => boolean,
+  yieldUntil: number,
+): Promise<ChildEntry[][]> {
+  const listings: ChildEntry[][] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < batch.length) {
+      const index = next;
+      next += 1;
+      listings[index] = await listWhenSearchesIdle(batch[index].resolvedPath, isUrgent, yieldUntil);
+    }
+  };
+  const workers = isUrgent() ? URGENT_INDEX_BUILD_CONCURRENCY : 1;
+  await Promise.all(Array.from({ length: workers }, worker));
+  return listings;
+}
+
 function searchesAreWaiting(): boolean {
   return activeWalks > 0 || filesystemCalls.pendingCount > 0;
 }
 
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
-}
-
-async function listInBackground(directory: string): Promise<ChildEntry[]> {
-  while (searchesAreWaiting()) {
+async function listWhenSearchesIdle(
+  directory: string,
+  isUrgent: () => boolean,
+  yieldUntil: number,
+): Promise<ChildEntry[]> {
+  while (!isUrgent() && searchesAreWaiting() && Date.now() < yieldUntil) {
     await new Promise((resolve) => setTimeout(resolve, INDEX_BUILD_YIELD_MS));
   }
   return listForIndex(directory);
@@ -504,7 +542,8 @@ function indexChildren(
   children: ChildEntry[],
   input: SearchInput,
   into: IndexBuild,
-): void {
+  maxEntries: number,
+): boolean {
   for (const child of children) {
     if (!staysInsideRoot(child, input.root) || !shouldDiscover(child, input)) continue;
     const relativePath = parent.relativePath ? `${parent.relativePath}/${child.name}` : child.name;
@@ -517,6 +556,7 @@ function indexChildren(
         mask: characterMask(lowerPath),
         ascii: isAscii(relativePath),
       });
+      if (into.entries.length > maxEntries) return false;
     }
     const depth = parent.depth + 1;
     if (
@@ -533,6 +573,7 @@ function indexChildren(
     into.visited.add(child.resolvedPath);
     into.next.push(directory);
   }
+  return true;
 }
 
 interface IndexQuery {

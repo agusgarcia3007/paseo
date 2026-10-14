@@ -8,111 +8,169 @@ export interface IndexedEntry {
 
 export type WatchRoot = (root: string, onChange: () => void) => Promise<() => void>;
 
+export type BuildIndex = (isUrgent: () => boolean) => Promise<IndexedEntry[] | null>;
+
 export interface PathIndexOptions {
+  watch: WatchRoot;
   maxEntries?: number;
-  watch?: WatchRoot;
+  idleMs?: number;
 }
 
-type Build = () => Promise<IndexedEntry[] | null>;
-
 interface Slot {
+  root: string;
   entries: IndexedEntry[] | null;
+  signature: string | null;
+  builtSeq: number;
   builtAt: number;
-  buildMs: number;
+  changeSeq: number;
   building: Promise<void> | null;
+  waiters: number;
   usedAt: number;
-  dirty: boolean;
-  watched: boolean;
-  unwatch: Promise<(() => void) | null>;
+  watching: Promise<boolean>;
+  unwatch: (() => void) | null;
 }
 
 const DEFAULT_MAX_ENTRIES = 250_000;
-const MIN_REFRESH_MS = 1_000;
-const REFRESH_PER_BUILD = 3;
-const WATCHED_REFRESH_MS = 60_000;
-const IDLE_MS = 10 * 60_000;
+const DEFAULT_IDLE_MS = 10 * 60_000;
+const SAFETY_REFRESH_MS = 60_000;
+const MAX_FRESH_BUILDS = 3;
 
 export class PathIndexes {
   readonly maxEntries: number;
-  private readonly watch: WatchRoot | undefined;
+  private readonly watch: WatchRoot;
+  private readonly idleMs: number;
   private readonly slots = new Map<string, Slot>();
+  private seq = 0;
+  private sweepTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(options: PathIndexOptions = {}) {
-    this.maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+  constructor(options: PathIndexOptions) {
     this.watch = options.watch;
+    this.maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    this.idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
   }
 
-  lookup(key: string, root: string, build: Build): IndexedEntry[] | null {
-    const now = Date.now();
-    this.evictIdle(now);
-    const slot = this.slots.get(key) ?? this.createSlot(key, root, now);
-    slot.usedAt = now;
-    if (!slot.building && this.isStale(slot, now)) {
-      slot.dirty = false;
-      slot.building = this.rebuild(slot, build);
+  prepare(key: string, root: string, signature: string, build: BuildIndex): void {
+    if (this.slots.has(key)) return;
+    this.createSlot(key, root, signature, build);
+    this.scheduleSweep();
+  }
+
+  async get(key: string, signature: string, build: BuildIndex): Promise<IndexedEntry[] | null> {
+    const slot = this.slots.get(key);
+    if (!slot) return null;
+    slot.usedAt = Date.now();
+    this.scheduleSweep();
+    if (slot.entries === null) return null;
+    if (slot.changeSeq < slot.builtSeq && slot.signature === signature) {
+      if (!slot.building && Date.now() - slot.builtAt >= SAFETY_REFRESH_MS) {
+        this.startBuild(slot, signature, build);
+      }
+      return slot.entries;
     }
-    return slot.entries;
+    return this.fresh(slot, signature, build);
   }
 
   async idle(): Promise<void> {
-    while (true) {
-      const pending = [...this.slots.values()].flatMap((slot) =>
-        slot.building ? [slot.building] : [],
-      );
-      if (pending.length === 0) return;
-      await Promise.all(pending);
+    const slots = [...this.slots.values()];
+    await Promise.all(slots.map((slot) => slot.watching));
+    for (const slot of slots) {
+      while (slot.building) await slot.building;
     }
   }
 
-  private createSlot(key: string, root: string, now: number): Slot {
-    const slot: Slot = {
-      entries: null,
-      builtAt: 0,
-      buildMs: 0,
-      building: null,
-      usedAt: now,
-      dirty: false,
-      watched: false,
-      unwatch: Promise.resolve(null),
-    };
-    if (this.watch) {
-      slot.unwatch = this.watch(root, () => {
-        slot.dirty = true;
-      }).then(
-        (unwatch) => {
-          slot.watched = true;
-          return unwatch;
-        },
-        () => null,
-      );
+  private async fresh(
+    slot: Slot,
+    signature: string,
+    build: BuildIndex,
+  ): Promise<IndexedEntry[] | null> {
+    slot.waiters += 1;
+    try {
+      for (let attempt = 0; attempt < MAX_FRESH_BUILDS; attempt += 1) {
+        while (slot.building) await slot.building;
+        if (slot.changeSeq < slot.builtSeq && slot.signature === signature) return slot.entries;
+        this.startBuild(slot, signature, build);
+      }
+      return null;
+    } finally {
+      slot.waiters -= 1;
     }
+  }
+
+  private createSlot(key: string, root: string, signature: string, build: BuildIndex): Slot {
+    const slot: Slot = {
+      root,
+      entries: null,
+      signature: null,
+      builtSeq: 0,
+      builtAt: 0,
+      changeSeq: 0,
+      building: null,
+      waiters: 0,
+      usedAt: Date.now(),
+      watching: Promise.resolve(false),
+      unwatch: null,
+    };
+    slot.watching = this.watch(root, () => {
+      this.seq += 1;
+      slot.changeSeq = this.seq;
+    }).then(
+      (unwatch) => {
+        if (this.slots.get(key) !== slot) {
+          unwatch();
+          return false;
+        }
+        slot.unwatch = unwatch;
+        this.startBuild(slot, signature, build);
+        return true;
+      },
+      () => false,
+    );
     this.slots.set(key, slot);
     return slot;
   }
 
-  private isStale(slot: Slot, now: number): boolean {
-    if (slot.builtAt === 0 || slot.dirty) return true;
-    const refreshAfter = slot.watched
-      ? WATCHED_REFRESH_MS
-      : Math.max(MIN_REFRESH_MS, slot.buildMs * REFRESH_PER_BUILD);
-    return now - slot.builtAt >= refreshAfter;
+  private startBuild(slot: Slot, signature: string, build: BuildIndex): void {
+    this.seq += 1;
+    const seq = this.seq;
+    const building = this.runBuild(slot, seq, signature, build);
+    slot.building = building;
   }
 
-  private async rebuild(slot: Slot, build: Build): Promise<void> {
-    const startedAt = Date.now();
-    const entries = await build().catch(() => null);
-    slot.entries = entries;
-    slot.builtAt = Date.now();
-    slot.buildMs = slot.builtAt - startedAt;
+  private async runBuild(
+    slot: Slot,
+    seq: number,
+    signature: string,
+    build: BuildIndex,
+  ): Promise<void> {
+    const entries = await build(() => slot.waiters > 0).catch(() => null);
     slot.building = null;
+    if (seq < slot.builtSeq) return;
+    slot.entries = entries;
+    slot.signature = signature;
+    slot.builtSeq = seq;
+    slot.builtAt = Date.now();
   }
 
-  private evictIdle(now: number): void {
-    for (const [key, slot] of this.slots) {
-      if (slot.building || now - slot.usedAt <= IDLE_MS) continue;
-      void slot.unwatch.then((unwatch) => unwatch?.());
-      this.slots.delete(key);
-    }
+  private scheduleSweep(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setTimeout(() => {
+      this.sweepTimer = null;
+      const now = Date.now();
+      for (const [key, slot] of this.slots) {
+        if (slot.building || slot.waiters > 0 || now - slot.usedAt < this.idleMs) continue;
+        this.evict(key);
+      }
+      if (this.slots.size > 0) this.scheduleSweep();
+    }, this.idleMs);
+    this.sweepTimer.unref?.();
+  }
+
+  private evict(key: string): void {
+    const slot = this.slots.get(key);
+    if (!slot) return;
+    this.slots.delete(key);
+    slot.unwatch?.();
+    slot.unwatch = null;
   }
 }
 
