@@ -1340,4 +1340,34 @@ describe("indexed search", () => {
 
     expect(entries).toEqual([{ path: "module-7.ts", kind: "file" }]);
   });
+
+  it("lets Add project find a folder past the walk's budget and one created since indexing", async () => {
+    for (let index = 0; index < 30; index += 1) {
+      mkdirSync(path.join(root, `package-${index}`, "src"), { recursive: true });
+    }
+    mkdirSync(path.join(root, "package-29", "src", "legacy-billing"));
+    const indexes = new PathIndexes();
+    const homeSearch = (query: string) =>
+      searchDirectoryEntries({
+        root,
+        query,
+        pathFormat: "absolute",
+        pathQueryPolicy: "rooted",
+        rootAliases: ["~"],
+        includeFiles: false,
+        includeDirectories: true,
+        maxEntriesScanned: 20,
+        pathIndexes: indexes,
+      });
+    await homeSearch("billing");
+    await indexes.idle();
+    mkdirSync(path.join(root, "fresh-billing"));
+
+    const entries = await homeSearch("billing");
+
+    expect(entries).toEqual([
+      { path: path.join(root, "fresh-billing"), kind: "directory" },
+      { path: path.join(root, "package-29", "src", "legacy-billing"), kind: "directory" },
+    ]);
+  });
 });

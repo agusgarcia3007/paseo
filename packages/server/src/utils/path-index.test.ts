@@ -127,4 +127,67 @@ describe("PathIndexes", () => {
       roots: ["/root", "/root"],
     });
   });
+
+  it("walks instead of waiting on a rebuild that does not finish", async () => {
+    vi.useFakeTimers();
+    const { indexes, watch } = watchedIndexes();
+    const { disk, build } = diskBuild(["a.ts"]);
+    await search(indexes, "", build);
+    await indexes.idle();
+    disk.hold = new Promise(() => {});
+    watch.changed();
+
+    const pending = search(indexes, "", build);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(await pending).toBeNull();
+  });
+
+  it("retries a build that exceeded the entry cap", async () => {
+    vi.useFakeTimers();
+    const { indexes } = watchedIndexes();
+    let listed: IndexedEntry[] | null = null;
+    let builds = 0;
+    const build = async () => {
+      builds += 1;
+      return listed;
+    };
+    await search(indexes, "", build);
+    await indexes.idle();
+    const oversized = await search(indexes, "", build);
+    listed = [entry("a.ts")];
+    vi.setSystemTime(Date.now() + 60_000);
+    await search(indexes, "", build);
+    await indexes.idle();
+
+    const retried = await search(indexes, "", build);
+
+    expect({ oversized, retried, builds }).toEqual({
+      oversized: null,
+      retried: [entry("a.ts")],
+      builds: 2,
+    });
+  });
+
+  it("answers from an unwatched index at once and refreshes it in the background", async () => {
+    vi.useFakeTimers();
+    const indexes = new PathIndexes();
+    const { disk, build } = diskBuild(["a.ts"]);
+    await search(indexes, "", build);
+    await indexes.idle();
+    disk.files = ["a.ts", "b.ts"];
+    const fresh = await search(indexes, "", build);
+    vi.setSystemTime(Date.now() + 1_000);
+    const stale = await search(indexes, "", build);
+    await indexes.idle();
+
+    const refreshed = await search(indexes, "", build);
+
+    expect({ fresh, stale, refreshed, builds: disk.builds }).toEqual({
+      fresh: [entry("a.ts")],
+      stale: [entry("a.ts")],
+      refreshed: [entry("a.ts"), entry("b.ts")],
+      builds: 2,
+    });
+  });
 });

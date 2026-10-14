@@ -284,6 +284,7 @@ type ProviderSubagentManagerEvent = Extract<
   { type: "provider_subagent" }
 >["event"];
 
+const HOME_PATH_INDEXES = new PathIndexes();
 const workspacePathIndexes = new WeakMap<WorkspaceGitService, PathIndexes>();
 
 function pathIndexesFor(workspaceGitService: WorkspaceGitService): PathIndexes {
@@ -5162,7 +5163,9 @@ export class Session {
         includeDirectories,
         matchMode,
         limit,
-        pathIndexes: searchesWorkspace ? pathIndexesFor(this.workspaceGitService) : undefined,
+        pathIndexes: searchesWorkspace
+          ? pathIndexesFor(this.workspaceGitService)
+          : HOME_PATH_INDEXES,
       });
       const directories = entries
         .filter((entry) => entry.kind === "directory")

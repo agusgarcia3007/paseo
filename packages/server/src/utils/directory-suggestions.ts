@@ -366,10 +366,10 @@ async function searchTree(
   const signature = ignoreSignature(input.gitIgnoredPaths);
   const build: BuildIndex = (isUrgent) => buildIndex(input, pathIndexes.maxEntries, isUrgent);
   const entries = await pathIndexes.get(key, signature, build);
-  if (entries) return searchIndex(entries, input);
+  if (entries && pathIndexes.watched) return searchIndex(entries, input);
   const walked = await walkTree(input, start);
   pathIndexes.prepare(key, input.root, signature, build);
-  return walked;
+  return entries ? [...walked, ...searchIndex(entries, input)] : walked;
 }
 
 async function walkTree(input: SearchInput, start: WalkStart): Promise<RankedEntry[]> {
